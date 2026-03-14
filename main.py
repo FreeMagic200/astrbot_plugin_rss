@@ -48,13 +48,38 @@ class RssPlugin(Star):
         self.pic_handler = RssImageHandler(self.is_adjust_pic)
         self.scheduler = AsyncIOScheduler()
 
-    @filter.on("plugin_loaded")
-    async def _init_scheduler(self):
-        """插件加载/重载完成后初始化调度器"""
-        self.logger.info("RSS 插件加载完成，初始化调度器")
+    def _ensure_scheduler_running(self):
+        """确保调度器已启动"""
         if not self.scheduler.running:
-            self.scheduler.start()
-        self._fresh_asyncIOScheduler()
+            try:
+                self.scheduler.start()
+                self.logger.info("RSS 调度器已启动")
+            except RuntimeError:
+                # 没有运行中的事件循环，延迟启动
+                pass
+
+    def _fresh_asyncIOScheduler(self):
+        """刷新定时任务"""
+        self._ensure_scheduler_running()
+        if not self.scheduler.running:
+            self.logger.warning("RSS 调度器未能启动，定时任务将不会执行")
+            return
+
+        # 删除所有定时任务
+        self.logger.info("刷新定时任务")
+        self.scheduler.remove_all_jobs()
+
+        # 为每个订阅添加定时任务
+        for url, info in self.data_handler.data.items():
+            if url == "rsshub_endpoints" or url == "settings":
+                continue
+            for user, sub_info in info["subscribers"].items():
+                self.scheduler.add_job(
+                    self.cron_task_callback,
+                    "cron",
+                    **self.parse_cron_expr(sub_info["cron_expr"]),
+                    args=[url, user],
+                )
 
     def parse_cron_expr(self, cron_expr: str):
         fields = cron_expr.split(" ")
@@ -261,24 +286,6 @@ class RssPlugin(Star):
                 url = "/" + url
             url = "https://" + url
         return url
-
-    def _fresh_asyncIOScheduler(self):
-        """刷新定时任务"""
-        # 删除所有定时任务
-        self.logger.info("刷新定时任务")
-        self.scheduler.remove_all_jobs()
-
-        # 为每个订阅添加定时任务
-        for url, info in self.data_handler.data.items():
-            if url == "rsshub_endpoints" or url == "settings":
-                continue
-            for user, sub_info in info["subscribers"].items():
-                self.scheduler.add_job(
-                    self.cron_task_callback,
-                    "cron",
-                    **self.parse_cron_expr(sub_info["cron_expr"]),
-                    args=[url, user],
-                )
 
     async def _add_url(self, url: str, cron_expr: str, message: AstrMessageEvent):
         """内部方法：添加URL订阅的共用逻辑"""
