@@ -324,19 +324,33 @@ class RssPlugin(Star):
     async def _get_chain_components(self, item: RSSItem):
         """组装消息链"""
         comps = []
-        comps.append(Comp.Plain(f"频道 {item.chan_title} 最新 Feed\n---\n标题: {item.title}\n---\n"))
+
+        # 文本部分
+        text_parts = [
+            f"频道 {item.chan_title} 最新 Feed",
+            f"标题: {item.title}"
+        ]
+
         if not self.is_hide_url:
-            comps.append(Comp.Plain(f"链接: {item.link}\n---\n"))
-        comps.append(Comp.Plain(item.description + "\n---\n"))
+            text_parts.append(f"链接: {item.link}")
+
+        if item.description:
+            text_parts.append(item.description)
+
+        comps.append(Comp.Plain("\n".join(text_parts) + "\n"))
+
+        # 图片部分
         if self.is_read_pic and item.pic_urls:
-            temp_max_pic_item = len(item.pic_urls) if self.max_pic_item == -1 else self.max_pic_item
-            for pic_url in item.pic_urls[:temp_max_pic_item]:
+            max_pic = len(item.pic_urls) if self.max_pic_item == -1 else self.max_pic_item
+
+            for pic_url in item.pic_urls[:max_pic]:
                 base64str = await self.pic_handler.modify_corner_pixel_to_base64(pic_url)
-                if base64str is None:
-                    comps.append(Comp.Plain("图片链接读取失败\n"))
-                    continue
-                else:
+
+                if base64str:
                     comps.append(Comp.Image.fromBase64(base64str))
+                else:
+                    comps.append(Comp.Plain("图片链接读取失败\n"))
+
         return comps
 
     def _is_url_or_ip(self, text: str) -> bool:
