@@ -1,8 +1,13 @@
+import logging
+
 from PIL import Image
 import aiohttp
 import random
 import base64
 from io import BytesIO
+
+logger = logging.getLogger("astrbot")
+
 
 class RssImageHandler:
     """rss处理图片的类"""
@@ -31,7 +36,7 @@ class RssImageHandler:
             async with aiohttp.ClientSession(trust_env=True) as session:
                 async with session.get(image_url) as resp:
                     if resp.status != 200:
-                        print(f"错误：无法从URL '{image_url}' 获取图片: 状态码 {resp.status}")
+                        logger.error(f"rss: 无法从URL '{image_url}' 获取图片: 状态码 {resp.status}")
                         return None
 
                     img_data = BytesIO(await resp.read())
@@ -70,8 +75,8 @@ class RssImageHandler:
                         return base64_string
 
         except aiohttp.ClientError as e:
-            print(f"错误：无法从URL '{image_url}' 获取图片: {e}")
+            logger.error(f"rss: 无法从URL '{image_url}' 获取图片: {e}")
             return None
         except Exception as e:
-            print(f"发生错误：{e}")
+            logger.error(f"rss: 图片处理发生错误: {e}")
             return None

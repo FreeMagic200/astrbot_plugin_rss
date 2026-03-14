@@ -3,10 +3,11 @@ import asyncio
 import time
 import re
 import logging
+from email.utils import parsedate_to_datetime
 from lxml import etree
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult,MessageChain
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig
 import astrbot.api.message_components as Comp
@@ -21,7 +22,7 @@ from typing import List
     "astrbot_plugin_rss",
     "Soulter",
     "RSS订阅插件",
-    "1.1.0",
+    "1.2.0",
     "https://github.com/Soulter/astrbot_plugin_rss",
 )
 class RssPlugin(Star):
@@ -40,13 +41,24 @@ class RssPlugin(Star):
         self.max_items_per_poll = config.get("max_items_per_poll")
         self.t2i = config.get("t2i")
         self.is_hide_url = config.get("is_hide_url")
-        self.is_read_pic= config.get("pic_config").get("is_read_pic")
-        self.is_adjust_pic= config.get("pic_config").get("is_adjust_pic")
+        self.is_read_pic = config.get("pic_config").get("is_read_pic")
+        self.is_adjust_pic = config.get("pic_config").get("is_adjust_pic")
         self.max_pic_item = config.get("pic_config").get("max_pic_item")
         self.is_compose = config.get("compose")
 
         self.pic_handler = RssImageHandler(self.is_adjust_pic)
         self.scheduler = AsyncIOScheduler()
+
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        """AstrBot 初始化完成后自动启动调度器并恢复所有订阅的定时任务"""
+        self._fresh_asyncIOScheduler()
+
+    async def terminate(self):
+        """插件卸载时停止调度器"""
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+            self.logger.info("RSS 调度器已停止")
 
     def _ensure_scheduler_running(self):
         """确保调度器已启动"""
@@ -54,9 +66,8 @@ class RssPlugin(Star):
             try:
                 self.scheduler.start()
                 self.logger.info("RSS 调度器已启动")
-            except RuntimeError:
-                # 没有运行中的事件循环，延迟启动
-                pass
+            except RuntimeError as e:
+                self.logger.warning(f"RSS 调度器启动失败: {e}")
 
     def _fresh_asyncIOScheduler(self):
         """刷新定时任务"""
@@ -65,11 +76,9 @@ class RssPlugin(Star):
             self.logger.warning("RSS 调度器未能启动，定时任务将不会执行")
             return
 
-        # 删除所有定时任务
         self.logger.info("刷新定时任务")
         self.scheduler.remove_all_jobs()
 
-        # 为每个订阅添加定时任务
         for url, info in self.data_handler.data.items():
             if url == "rsshub_endpoints" or url == "settings":
                 continue
@@ -93,16 +102,17 @@ class RssPlugin(Star):
 
     async def parse_channel_info(self, url):
         headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
         try:
-            async with aiohttp.ClientSession(trust_env=True,
-                                        connector=connector,
-                                        timeout=timeout,
-                                        headers=headers
-                                        ) as session:
+            async with aiohttp.ClientSession(
+                trust_env=True,
+                connector=connector,
+                timeout=timeout,
+                headers=headers,
+            ) as session:
                 async with session.get(url) as resp:
                     if resp.status != 200:
                         self.logger.error(f"rss: 无法正常打开站点 {url}")
@@ -140,8 +150,8 @@ class RssPlugin(Star):
         )
         max_ts = last_update
 
-        # 分解MessageSesion
-        platform_name,message_type,session_id = user.split(":")
+        # 分解 unified_msg_origin
+        platform_name, message_type, session_id = user.split(":")
 
         # 分平台处理消息
         if platform_name == "aiocqhttp" and self.is_compose:
@@ -149,48 +159,31 @@ class RssPlugin(Star):
             for item in rss_items:
                 comps = await self._get_chain_components(item)
                 node = Comp.Node(
-                            uin=0,
-                            name="Astrbot",
-                            content=comps
-                        )
-                nodes.append(node)
-                self.data_handler.data[url]["subscribers"][user]["last_update"] = int(
-                    time.time()
+                    uin=0,
+                    name="Astrbot",
+                    content=comps,
                 )
+                nodes.append(node)
                 max_ts = max(max_ts, item.pubDate_timestamp)
 
-            # 合并消息发送
             if len(nodes) > 0:
-                msc = MessageChain(
-                    chain=nodes,
-                    use_t2i_= self.t2i
-                )
+                msc = MessageChain(chain=nodes, use_t2i_=self.t2i)
                 await self.context.send_message(user, msc)
         else:
-            # 每个消息单独发送
             for item in rss_items:
                 comps = await self._get_chain_components(item)
-                msc = MessageChain(
-                chain=comps,
-                use_t2i_= self.t2i
-            )
+                msc = MessageChain(chain=comps, use_t2i_=self.t2i)
                 await self.context.send_message(user, msc)
-                self.data_handler.data[url]["subscribers"][user]["last_update"] = int(
-                    time.time()
-                )
                 max_ts = max(max_ts, item.pubDate_timestamp)
 
-        # 更新最后更新时间
+        # 更新最后更新时间和最新链接
         if rss_items:
             self.data_handler.data[url]["subscribers"][user]["last_update"] = max_ts
-            self.data_handler.data[url]["subscribers"][user]["latest_link"] = rss_items[
-                0
-            ].link
+            self.data_handler.data[url]["subscribers"][user]["latest_link"] = rss_items[0].link
             self.data_handler.save_data()
             self.logger.info(f"RSS 定时任务 {url} 推送成功 - {user}")
         else:
             self.logger.info(f"RSS 定时任务 {url} 无消息更新 - {user}")
-
 
     async def poll_rss(
         self,
@@ -218,32 +211,33 @@ class RssPlugin(Star):
                     else "未知频道"
                 )
 
-                title = item.xpath("title")[0].text
+                title_nodes = item.xpath("title")
+                title = title_nodes[0].text if title_nodes and title_nodes[0].text else "（无标题）"
                 if len(title) > self.title_max_length:
                     title = title[: self.title_max_length] + "..."
 
-                link = item.xpath("link")[0].text
-                if not re.match(r"^https?://", link):
+                link_nodes = item.xpath("link")
+                link = link_nodes[0].text if link_nodes and link_nodes[0].text else ""
+                if link and not re.match(r"^https?://", link):
                     link = self.data_handler.get_root_url(url) + link
 
-                description = item.xpath("description")[0].text
+                desc_nodes = item.xpath("description")
+                raw_description = desc_nodes[0].text if desc_nodes and desc_nodes[0].text else ""
 
-                pic_url_list = self.data_handler.strip_html_pic(description)
-                description = self.data_handler.strip_html(description)
+                pic_url_list = self.data_handler.strip_html_pic(raw_description)
+                description = self.data_handler.strip_html(raw_description)
 
                 if len(description) > self.description_max_length:
-                    description = (
-                        description[: self.description_max_length] + "..."
-                    )
+                    description = description[: self.description_max_length] + "..."
 
-                if item.xpath("pubDate"):
-                    # 根据 pubDate 判断是否为新内容
-                    pub_date = item.xpath("pubDate")[0].text
-                    pub_date_parsed = time.strptime(
-                        pub_date.replace("GMT", "+0000"),
-                        "%a, %d %b %Y %H:%M:%S %z",
-                    )
-                    pub_date_timestamp = int(time.mktime(pub_date_parsed))
+                pub_date_nodes = item.xpath("pubDate")
+                if pub_date_nodes and pub_date_nodes[0].text:
+                    pub_date = pub_date_nodes[0].text
+                    try:
+                        pub_date_timestamp = int(parsedate_to_datetime(pub_date).timestamp())
+                    except Exception:
+                        pub_date_timestamp = 0
+
                     if pub_date_timestamp > after_timestamp:
                         rss_items.append(
                             RSSItem(
@@ -253,7 +247,7 @@ class RssPlugin(Star):
                                 description,
                                 pub_date,
                                 pub_date_timestamp,
-                                pic_url_list
+                                pic_url_list,
                             )
                         )
                         cnt += 1
@@ -291,26 +285,32 @@ class RssPlugin(Star):
         """内部方法：添加URL订阅的共用逻辑"""
         user = message.unified_msg_origin
         if url in self.data_handler.data:
-            latest_item = await self.poll_rss(url)
+            latest_items = await self.poll_rss(url)
+            last_update = latest_items[0].pubDate_timestamp if latest_items else 0
+            latest_link = latest_items[0].link if latest_items else ""
             self.data_handler.data[url]["subscribers"][user] = {
                 "cron_expr": cron_expr,
-                "last_update": latest_item[0].pubDate_timestamp,
-                "latest_link": latest_item[0].link,
+                "last_update": last_update,
+                "latest_link": latest_link,
             }
         else:
             try:
                 text = await self.parse_channel_info(url)
+                if text is None:
+                    return message.plain_result("无法连接到该 RSS 地址，请检查 URL 是否正确")
                 title, desc = self.data_handler.parse_channel_text_info(text)
-                latest_item = await self.poll_rss(url)
+                latest_items = await self.poll_rss(url)
             except Exception as e:
                 return message.plain_result(f"解析频道信息失败: {str(e)}")
 
+            last_update = latest_items[0].pubDate_timestamp if latest_items else 0
+            latest_link = latest_items[0].link if latest_items else ""
             self.data_handler.data[url] = {
                 "subscribers": {
                     user: {
                         "cron_expr": cron_expr,
-                        "last_update": latest_item[0].pubDate_timestamp,
-                        "latest_link": latest_item[0].link,
+                        "last_update": last_update,
+                        "latest_link": latest_link,
                     }
                 },
                 "info": {
@@ -327,9 +327,8 @@ class RssPlugin(Star):
         comps.append(Comp.Plain(f"频道 {item.chan_title} 最新 Feed\n---\n标题: {item.title}\n---\n"))
         if not self.is_hide_url:
             comps.append(Comp.Plain(f"链接: {item.link}\n---\n"))
-        comps.append(Comp.Plain(item.description+"\n---\n"))
+        comps.append(Comp.Plain(item.description + "\n---\n"))
         if self.is_read_pic and item.pic_urls:
-            # 如果max_pic_item为-1则不限制图片数量
             temp_max_pic_item = len(item.pic_urls) if self.max_pic_item == -1 else self.max_pic_item
             for pic_url in item.pic_urls[:temp_max_pic_item]:
                 base64str = await self.pic_handler.modify_corner_pixel_to_base64(pic_url)
@@ -340,11 +339,8 @@ class RssPlugin(Star):
                     comps.append(Comp.Image.fromBase64(base64str))
         return comps
 
-
-    def _is_url_or_ip(self,text: str) -> bool:
-        """
-        判断一个字符串是否为网址（http/https 开头）或 IP 地址。
-        """
+    def _is_url_or_ip(self, text: str) -> bool:
+        """判断一个字符串是否为网址（http/https 开头）或 IP 地址。"""
         url_pattern = r"^(?:http|https)://.+$"
         ip_pattern = r"^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
         return bool(re.match(url_pattern, text) or re.match(ip_pattern, text))
@@ -382,11 +378,9 @@ class RssPlugin(Star):
         """
         if url.endswith("/"):
             url = url[:-1]
-        # 检查是否为url或ip
         if not self._is_url_or_ip(url):
             yield event.plain_result("请输入正确的URL")
             return
-        # 检查该网址是否已存在
         elif url in self.data_handler.data["rsshub_endpoints"]:
             yield event.plain_result("该RSSHub端点已存在")
             return
@@ -420,8 +414,6 @@ class RssPlugin(Star):
             yield event.plain_result("索引越界")
             return
         else:
-            # TODO:删除对应的定时任务
-            self.scheduler.remove_job()
             self.data_handler.data["rsshub_endpoints"].pop(idx)
             self.data_handler.save_data()
             yield event.plain_result("删除成功")
@@ -469,7 +461,6 @@ class RssPlugin(Star):
             chan_title = ret["title"]
             chan_desc = ret["description"]
 
-        # 刷新定时任务
         self._fresh_asyncIOScheduler()
 
         yield event.plain_result(
@@ -497,6 +488,7 @@ class RssPlugin(Star):
             month: Cron表达式月份字段
             day_of_week: Cron表达式星期字段
         """
+        url = self.parse_rss_url(url)
         cron_expr = f"{minute} {hour} {day} {month} {day_of_week}"
         ret = await self._add_url(url, cron_expr, event)
         if isinstance(ret, MessageEventResult):
@@ -506,7 +498,6 @@ class RssPlugin(Star):
             chan_title = ret["title"]
             chan_desc = ret["description"]
 
-        # 刷新定时任务
         self._fresh_asyncIOScheduler()
 
         yield event.plain_result(
@@ -517,14 +508,22 @@ class RssPlugin(Star):
     async def list_command(self, event: AstrMessageEvent):
         """列出当前所有订阅的RSS频道"""
         user = event.unified_msg_origin
-        ret = "当前订阅的频道：\n"
         subs_urls = self.data_handler.get_subs_channel_url(user)
-        cnt = 0
-        for url in subs_urls:
+        if not subs_urls:
+            yield event.plain_result("当前没有订阅任何频道")
+            return
+        lines = ["当前订阅的频道："]
+        for cnt, url in enumerate(subs_urls):
             info = self.data_handler.data[url]["info"]
-            ret += f"{cnt}. {info['title']} - {info['description']}\n"
-            cnt += 1
-        yield event.plain_result(ret)
+            sub_info = self.data_handler.data[url]["subscribers"][user]
+            cron_expr = sub_info.get("cron_expr", "未知")
+            lines.append(
+                f"{cnt}. {info['title']}\n"
+                f"   描述: {info['description']}\n"
+                f"   定时: {cron_expr}\n"
+                f"   URL: {url}"
+            )
+        yield event.plain_result("\n".join(lines))
 
     @rss.command("remove")
     async def remove_command(self, event: AstrMessageEvent, idx: int):
@@ -539,12 +538,44 @@ class RssPlugin(Star):
             return
         url = subs_urls[idx]
         self.data_handler.data[url]["subscribers"].pop(event.unified_msg_origin)
-
         self.data_handler.save_data()
 
-        # 刷新定时任务
         self._fresh_asyncIOScheduler()
         yield event.plain_result("删除成功")
+
+    @rss.command("update")
+    async def update_command(
+        self,
+        event: AstrMessageEvent,
+        idx: int,
+        minute: str,
+        hour: str,
+        day: str,
+        month: str,
+        day_of_week: str,
+    ):
+        """更新一个订阅的推送频率
+
+        Args:
+            idx: 要更新的订阅索引，可通过/rss list查看
+            minute: 新的Cron表达式分钟字段
+            hour: 新的Cron表达式小时字段
+            day: 新的Cron表达式日期字段
+            month: 新的Cron表达式月份字段
+            day_of_week: 新的Cron表达式星期字段
+        """
+        user = event.unified_msg_origin
+        subs_urls = self.data_handler.get_subs_channel_url(user)
+        if idx < 0 or idx >= len(subs_urls):
+            yield event.plain_result("索引越界, 请使用 /rss list 查看已经添加的订阅")
+            return
+        url = subs_urls[idx]
+        new_cron = f"{minute} {hour} {day} {month} {day_of_week}"
+        self.data_handler.data[url]["subscribers"][user]["cron_expr"] = new_cron
+        self.data_handler.save_data()
+        self._fresh_asyncIOScheduler()
+        chan_title = self.data_handler.data[url]["info"]["title"]
+        yield event.plain_result(f"已将「{chan_title}」的推送频率更新为: {new_cron}")
 
     @rss.command("get")
     async def get_command(self, event: AstrMessageEvent, idx: int):
@@ -563,17 +594,14 @@ class RssPlugin(Star):
             yield event.plain_result("没有新的订阅内容")
             return
         item = rss_items[0]
-        # 分解MessageSesion
-        platform_name,message_type,session_id = event.unified_msg_origin.split(":")
-        # 构造返回消息链
+        platform_name, message_type, session_id = event.unified_msg_origin.split(":")
         comps = await self._get_chain_components(item)
-        # 区分平台
-        if(platform_name == "aiocqhttp" and self.is_compose):
+        if platform_name == "aiocqhttp" and self.is_compose:
             node = Comp.Node(
-                    uin=0,
-                    name="Astrbot",
-                    content=comps
-                )
+                uin=0,
+                name="Astrbot",
+                content=comps,
+            )
             yield event.chain_result([node]).use_t2i(self.t2i)
         else:
             yield event.chain_result(comps).use_t2i(self.t2i)
