@@ -4,8 +4,6 @@
 
 支持通过 RSSHub 路由和直接 URL 订阅 RSS 源，并定时获取最新的 RSS 内容。
 
-<img width=300 src="https://github.com/user-attachments/assets/16886f57-886c-4aad-abd1-2edd5d1f2c06">
-
 ## 功能
 
 - 添加、列出和删除 RSSHub endpoint
