@@ -47,8 +47,13 @@ class RssPlugin(Star):
 
         self.pic_handler = RssImageHandler(self.is_adjust_pic)
         self.scheduler = AsyncIOScheduler()
-        self.scheduler.start()
 
+    @filter.on("plugin_loaded")
+    async def _init_scheduler(self):
+        """插件加载/重载完成后初始化调度器"""
+        self.logger.info("RSS 插件加载完成，初始化调度器")
+        if not self.scheduler.running:
+            self.scheduler.start()
         self._fresh_asyncIOScheduler()
 
     def parse_cron_expr(self, cron_expr: str):
