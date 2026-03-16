@@ -26,6 +26,7 @@ class DataHandler:
     def load_data(self):
         """从数据文件中加载数据"""
         if not os.path.exists(self.config_path):
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
             with open(self.config_path, "w", encoding="utf-8") as f:
                 f.write(json.dumps(self.default_config, indent=2, ensure_ascii=False))
         with open(self.config_path, "r", encoding="utf-8") as f:

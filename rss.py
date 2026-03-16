@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-import astrbot.api.message_components as Comp
+
 
 @dataclass
 class RSSItem:

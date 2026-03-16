@@ -1,11 +1,9 @@
 import aiohttp
 import asyncio
-import time
 import re
 import logging
 from email.utils import parsedate_to_datetime
 from lxml import etree
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
 from astrbot.api.star import Context, Star, register
@@ -33,7 +31,6 @@ class RssPlugin(Star):
         self.context = context
         self.config = config
         self.data_handler = DataHandler()
-        self.pic_handler = RssImageHandler()
 
         # 提取scheme文件中的配置
         self.title_max_length = config.get("title_max_length")
@@ -47,58 +44,68 @@ class RssPlugin(Star):
         self.is_compose = config.get("compose")
 
         self.pic_handler = RssImageHandler(self.is_adjust_pic)
-        self.scheduler = AsyncIOScheduler()
+
+        # 记录 (url, user) -> job_id 的映射，用于后续更新/删除
+        self._job_ids: dict[str, str] = {}
+
+    def _job_key(self, url: str, user: str) -> str:
+        return f"{url}::{user}"
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        """AstrBot 初始化完成后自动启动调度器并恢复所有订阅的定时任务"""
-        self._fresh_asyncIOScheduler()
+        """AstrBot 初始化完成后自动注册所有订阅的定时任务"""
+        await self._refresh_all_jobs()
 
     async def terminate(self):
-        """插件卸载时停止调度器"""
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
-            self.logger.info("RSS 调度器已停止")
-
-    def _ensure_scheduler_running(self):
-        """确保调度器已启动"""
-        if not self.scheduler.running:
+        """插件卸载时删除所有已注册的定时任务"""
+        for job_id in list(self._job_ids.values()):
             try:
-                self.scheduler.start()
-                self.logger.info("RSS 调度器已启动")
-            except RuntimeError as e:
-                self.logger.warning(f"RSS 调度器启动失败: {e}")
+                await self.context.cron_manager.delete_job(job_id)
+            except Exception as e:
+                self.logger.warning(f"RSS 删除定时任务失败: {e}")
+        self._job_ids.clear()
+        self.logger.info("RSS 所有定时任务已清理")
 
-    def _fresh_asyncIOScheduler(self):
-        """刷新定时任务"""
-        self._ensure_scheduler_running()
-        if not self.scheduler.running:
-            self.logger.warning("RSS 调度器未能启动，定时任务将不会执行")
-            return
+    async def _refresh_all_jobs(self):
+        """清除并重新注册所有订阅的定时任务"""
+        # 先删除旧任务
+        for job_id in list(self._job_ids.values()):
+            try:
+                await self.context.cron_manager.delete_job(job_id)
+            except Exception:
+                pass
+        self._job_ids.clear()
 
         self.logger.info("刷新定时任务")
-        self.scheduler.remove_all_jobs()
-
         for url, info in self.data_handler.data.items():
-            if url == "rsshub_endpoints" or url == "settings":
+            if url in ("rsshub_endpoints", "settings"):
                 continue
             for user, sub_info in info["subscribers"].items():
-                self.scheduler.add_job(
-                    self.cron_task_callback,
-                    "cron",
-                    **self.parse_cron_expr(sub_info["cron_expr"]),
-                    args=[url, user],
-                )
+                await self._register_job(url, user, sub_info["cron_expr"])
 
-    def parse_cron_expr(self, cron_expr: str):
-        fields = cron_expr.split(" ")
-        return {
-            "minute": fields[0],
-            "hour": fields[1],
-            "day": fields[2],
-            "month": fields[3],
-            "day_of_week": fields[4],
-        }
+    async def _register_job(self, url: str, user: str, cron_expr: str):
+        """为单个订阅注册定时任务"""
+        key = self._job_key(url, user)
+        job = await self.context.cron_manager.add_basic_job(
+            name=f"rss_{key}",
+            cron_expression=cron_expr,
+            handler=self.cron_task_callback,
+            payload={"url": url, "user": user},
+            persistent=False,
+        )
+        self._job_ids[key] = job.job_id
+        self.logger.info(f"RSS 定时任务已注册: {url} - {user} (job_id={job.job_id})")
+
+    async def _unregister_job(self, url: str, user: str):
+        """删除单个订阅的定时任务"""
+        key = self._job_key(url, user)
+        job_id = self._job_ids.pop(key, None)
+        if job_id:
+            try:
+                await self.context.cron_manager.delete_job(job_id)
+                self.logger.info(f"RSS 定时任务已删除: {url} - {user}")
+            except Exception as e:
+                self.logger.warning(f"RSS 删除定时任务失败 ({url} - {user}): {e}")
 
     async def parse_channel_info(self, url):
         headers = {
@@ -151,7 +158,7 @@ class RssPlugin(Star):
         max_ts = last_update
 
         # 分解 unified_msg_origin
-        platform_name, message_type, session_id = user.split(":")
+        platform_name, message_type, session_id = user.split(":", 2)
 
         # 分平台处理消息
         if platform_name == "aiocqhttp" and self.is_compose:
@@ -276,9 +283,7 @@ class RssPlugin(Star):
     def parse_rss_url(self, url: str) -> str:
         """解析RSS URL，确保以http或https开头"""
         if not re.match(r"^https?://", url):
-            if not url.startswith("/"):
-                url = "/" + url
-            url = "https://" + url
+            url = "https://" + url.lstrip("/")
         return url
 
     async def _add_url(self, url: str, cron_expr: str, message: AstrMessageEvent):
@@ -475,7 +480,9 @@ class RssPlugin(Star):
             chan_title = ret["title"]
             chan_desc = ret["description"]
 
-        self._fresh_asyncIOScheduler()
+        user = event.unified_msg_origin
+        await self._unregister_job(url, user)
+        await self._register_job(url, user, cron_expr)
 
         yield event.plain_result(
             f"添加成功。频道信息：\n标题: {chan_title}\n描述: {chan_desc}"
@@ -512,7 +519,9 @@ class RssPlugin(Star):
             chan_title = ret["title"]
             chan_desc = ret["description"]
 
-        self._fresh_asyncIOScheduler()
+        user = event.unified_msg_origin
+        await self._unregister_job(url, user)
+        await self._register_job(url, user, cron_expr)
 
         yield event.plain_result(
             f"添加成功。频道信息：\n标题: {chan_title}\n描述: {chan_desc}"
@@ -546,15 +555,16 @@ class RssPlugin(Star):
         Args:
             idx: 要删除的订阅索引，可通过/rss list查看
         """
-        subs_urls = self.data_handler.get_subs_channel_url(event.unified_msg_origin)
+        user = event.unified_msg_origin
+        subs_urls = self.data_handler.get_subs_channel_url(user)
         if idx < 0 or idx >= len(subs_urls):
             yield event.plain_result("索引越界, 请使用 /rss list 查看已经添加的订阅")
             return
         url = subs_urls[idx]
-        self.data_handler.data[url]["subscribers"].pop(event.unified_msg_origin)
+        self.data_handler.data[url]["subscribers"].pop(user)
         self.data_handler.save_data()
 
-        self._fresh_asyncIOScheduler()
+        await self._unregister_job(url, user)
         yield event.plain_result("删除成功")
 
     @rss.command("update")
@@ -587,7 +597,10 @@ class RssPlugin(Star):
         new_cron = f"{minute} {hour} {day} {month} {day_of_week}"
         self.data_handler.data[url]["subscribers"][user]["cron_expr"] = new_cron
         self.data_handler.save_data()
-        self._fresh_asyncIOScheduler()
+
+        await self._unregister_job(url, user)
+        await self._register_job(url, user, new_cron)
+
         chan_title = self.data_handler.data[url]["info"]["title"]
         yield event.plain_result(f"已将「{chan_title}」的推送频率更新为: {new_cron}")
 
@@ -608,7 +621,7 @@ class RssPlugin(Star):
             yield event.plain_result("没有新的订阅内容")
             return
         item = rss_items[0]
-        platform_name, message_type, session_id = event.unified_msg_origin.split(":")
+        platform_name, message_type, session_id = event.unified_msg_origin.split(":", 2)
         comps = await self._get_chain_components(item)
         if platform_name == "aiocqhttp" and self.is_compose:
             node = Comp.Node(
